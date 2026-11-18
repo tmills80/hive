@@ -249,11 +249,22 @@ export function isDuplicateSession(e: unknown): boolean {
 }
 
 export function claimInitialWindow(
-  start: { pane: string; window: string },
+  start: { pane: string; window: string; pid?: string },
   windowName: string,
   projectId: number | null,
+  retained = false,
 ): { pane: string; window: string } {
   const { pane, window } = start;
+  if (!retained && start.pid && paneCommandState(start.pid) === "exited") {
+
+    // The command this pane was born with died on the spot. The claim is the caller's first news
+    // of that, and it cannot wait for tmux to close the window on its own schedule and then report
+    // it: waiting would mean recording a dead pane. The window is hive's own and nothing is left in
+    // it, so hive closes it now and the rename below reports the loss in tmux's own words.
+    //
+    // A retained pane is left alone: its tail is what the caller's readiness wait reports.
+    closeDeadWindow(window);
+  }
   configureHiveWindow(window, true, projectId);
   tmux("rename-window", "-t", window, windowName);
   return { pane, window };
@@ -484,6 +495,113 @@ export function paneProcessExited(target: string): boolean | null {
   }
 }
 
+// The OS's view of a pane's process, which is not tmux's. tmux's server reaps a dead child within a
+// millisecond or two, but the window that held the child survives for tens of milliseconds after
+// that, so a probe that asks tmux whether the pane is dead can answer "alive" for a command that
+// died on the spot - and which tmux build answers that way depends on how fast that build reaps.
+//
+// The OS knows sooner. An exited process is either gone or a zombie its parent, the tmux server, has
+// not reaped yet, and a zombie is a pid that kill(pid, 0) cannot tell apart from a live one, so the
+// state is read rather than inferred from the pid's existence.
+export type PaneProcessState = "running" | "exited" | "unknown";
+
+interface PaneProcessFacts {
+  state: PaneProcessState;
+  established: boolean;
+}
+
+// One ps call answers both questions hive asks about a pane's process: whether it has died, and
+// whether it is the command yet. `established` is the same test hive already makes before it
+// destroys a pane - a process group of its own and a tty of its own.
+function paneProcessFacts(pid: string): PaneProcessFacts {
+  try {
+    const out = execFileSync("ps", ["-o", "state=", "-o", "pgid=", "-o", "tty=", "-p", pid], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 50,
+      killSignal: "SIGKILL",
+    }).trim();
+    const [state, pgid, tty] = out.split(/\s+/, 3);
+    return {
+      state: state === "Z" ? "exited" : state ? "running" : "unknown",
+      established: pgid === pid && !!tty && tty !== "?",
+    };
+  } catch (e) {
+
+    // ps exits 1 when no process matches, which is the process being gone.
+    const status = (e as { status?: number | null }).status;
+    return { state: status === 1 ? "exited" : "unknown", established: false };
+  }
+}
+
+// The plain read: has this process died? Exact once the command has had its moment, and the
+// answer is the OS's rather than tmux's.
+export function paneProcessState(pid: string): PaneProcessState {
+  if (!/^\d+$/.test(pid)) return "unknown";
+  return paneProcessFacts(pid).state;
+}
+
+// Whether the pane's command died on the spot, as the OS sees it.
+//
+// The pane's child is forked from the tmux server and execs its command a moment later, so a state
+// read taken at once can still see the fork rather than the command, and the fork is alive. Waiting
+// for the process to establish is what makes the read conclusive: by then the command has run, and
+// either it is running or it has died.
+//
+// The wait is bounded, and a command that cannot be established at all is "unknown" rather than a
+// guess: hive then asks tmux, as it always did.
+const COMMAND_STATE_BOUND_MS = 200;
+
+// How long a command that has started gets before hive believes it is running. This is the same
+// window tmux's own probe gave the decision on a fast tmux build - the probe landed tens of
+// milliseconds after the pane was created, and a command that died inside that window was refused -
+// and it is what makes the refusal the same on every tmux build instead of a race against how fast
+// that build reaps.
+const COMMAND_SETTLE_MS = 25;
+
+export function paneCommandState(pid: string): PaneProcessState {
+  if (!/^\d+$/.test(pid)) return "unknown";
+  const deadline = Date.now() + COMMAND_STATE_BOUND_MS;
+  for (;;) {
+    const facts = paneProcessFacts(pid);
+    if (facts.state === "exited") return "exited";
+    if (facts.established) {
+
+      // The command is running now. It gets the settle window before hive believes it, so a
+      // command that dies the instant it starts is caught rather than recorded as a live worker.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, COMMAND_SETTLE_MS);
+      return paneProcessFacts(pid).state;
+    }
+    if (Date.now() >= deadline) return "unknown";
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
+  }
+}
+
+// A window whose command died on the spot is hive's own and has nothing left in it. tmux closes it
+// on its own schedule, tens of milliseconds from now, so anything that asks about the window before
+// then would see a window that is about to be gone. Hive closes it now, and the next call asks
+// tmux about a window that is already gone - which is how the loss reaches the caller in tmux's own
+// words.
+export function closeDeadWindow(window: string): void {
+  try {
+    tmux("kill-window", "-t", window);
+  } catch {
+
+    // The window is already gone, or the session with it. Nothing left to close.
+  }
+}
+
+// The same for a pane: a dead tile in a window a human is looking at is a leftover, and tmux would
+// remove it on its own schedule.
+export function closeDeadPane(pane: string): void {
+  try {
+    tmux("kill-pane", "-t", pane);
+  } catch {
+
+    // The pane is already gone. Nothing left to close.
+  }
+}
+
 export interface AliveSnapshot {
   panes: Set<string>;
   windows: Set<string>;
@@ -534,18 +652,7 @@ export function panePidForRecord(target: string): string {
 const DESTROY_READINESS_BOUND_MS = 200;
 
 function paneHasEstablishedProcess(pid: string): boolean {
-  try {
-    const status = execFileSync("ps", ["-o", "pgid=", "-o", "tty=", "-p", pid], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 50,
-      killSignal: "SIGKILL",
-    }).trim();
-    const [pgid, tty] = status.split(/\s+/, 2);
-    return pgid === pid && !!tty && tty !== "?";
-  } catch {
-    return false;
-  }
+  return paneProcessFacts(pid).established;
 }
 
 export function waitForPaneEstablished(
@@ -883,6 +990,13 @@ export function createWindow(
     ...(retainOnExit ? retainOnExitArgs(`=${session}:${windowName}`) : []),
   );
   const [pane, window, pid = ""] = created.split("\t");
+  if (!retainOnExit && paneCommandState(pid) === "exited") {
+
+    // The command died on the spot. A retained pane is left alone - its tail is what the caller's
+    // readiness wait reports - but an ordinary window has nothing left in it, and tmux would close
+    // it tens of milliseconds from now, so hive closes it now.
+    closeDeadWindow(window);
+  }
   configureHiveWindow(window, true, projectId);
   return { pane, window, pid };
 }

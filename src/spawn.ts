@@ -10,6 +10,7 @@ import { WORKER_RECOVERY_RETENTION_SECONDS } from "./workerRecovery.js";
 import {
   applyLayout,
   claimInitialWindow,
+  closeDeadPane,
   createWindow,
   DEFAULT_LAYOUT,
   ensureSession,
@@ -17,7 +18,9 @@ import {
   findProcessesWindow,
   findProjectWindow,
   isPaneTarget,
+  paneCommandState,
   paneProcessExited,
+  paneProcessState,
   paneWindow,
   PROCESSES_LAYOUT,
   processesPaneTitle,
@@ -148,8 +151,17 @@ function recordPane(agentId: number, target: string, socket: string, pid: string
 
 // The creation pid proves the pane existed, not that its process still runs. A retained pane is
 // left to the caller's readiness wait, which reports the exit with its tail.
-function refuseIfExitedImmediately(target: string, retained: boolean): void {
-  if (retained || paneProcessExited(target) !== true) return;
+//
+// The pid is asked because it is the only answer that does not depend on how fast the tmux server
+// notices a dead child: tmux closes the window tens of milliseconds after the process died, so a
+// probe that asks tmux can call a command that died on the spot alive, and which tmux build does
+// that depends on how fast that build reaps. The creation site has already given the command its
+// moment, so the OS's answer here is the command's fate and not a race.
+function refuseIfExitedImmediately(target: string, retained: boolean, pid: string): void {
+  if (retained) return;
+  const state = pid ? paneProcessState(pid) : "unknown";
+  const exited = state === "exited" || (state === "unknown" && paneProcessExited(target) === true);
+  if (!exited) return;
   discardOrphanedPane(target);
   throw new Error(
     `The command exited immediately, so its pane ${target} was discarded rather than recorded as running. ` +
@@ -272,7 +284,7 @@ function placeAgentPane(
       // Deliberate for placement "processes" too: this pane IS the new session's initial window, so it
       // takes that window rather than a tile. The caller reports it; `hive hide` moves it in later.
       pid = started.pid;
-      return claimInitialWindow(started, windowName, windowOwnerId).pane;
+      return claimInitialWindow(started, windowName, windowOwnerId, spec.retainOnExit ?? false).pane;
     }
     const splitInto = (window: string, layout: WindowLayout): string => {
       const [pane, created = ""] = tmuxWithClientPath(paneEnvPath(),
@@ -282,6 +294,13 @@ function placeAgentPane(
       ).split("\t");
       pid = created;
       if (spec.retainOnExit) onRetainArmed(window);
+      else if (paneCommandState(created) === "exited") {
+
+        // The command died on the spot. The pane is hive's own and nothing is left in it, and tmux
+        // would close it on its own schedule, so hive closes it now rather than leaving a dead
+        // tile in a window a human is looking at.
+        closeDeadPane(pane);
+      }
       applyLayout(window, layout);
       layoutApplied = true;
       return pane;
@@ -396,7 +415,7 @@ export function launchAgent(spec: LaunchSpec): {
     });
     const { target, landedInProjectId, layoutApplied, inProcessesWindow } = placed;
     const pid = createdPidOrDiscard(target, placed.pid);
-    refuseIfExitedImmediately(target, spec.retainOnExit ?? false);
+    refuseIfExitedImmediately(target, spec.retainOnExit ?? false, pid);
     paneUp = true;
 
     if (!recordPane(agentId, target, socket, pid)) {
@@ -520,7 +539,7 @@ export function resumeAgent(
     const placed = placeAgentPane(session, spec, envFlags, spec.commandString, title);
     const { target, landedInProjectId } = placed;
     const pid = createdPidOrDiscard(target, placed.pid);
-    refuseIfExitedImmediately(target, false);
+    refuseIfExitedImmediately(target, false, pid);
     paneUp = true;
 
     if (!recordPane(spec.agentId, target, socket, pid)) {

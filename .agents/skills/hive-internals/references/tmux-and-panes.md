@@ -181,6 +181,62 @@ creation verbs directly and several create command-less sessions, which wedge
 by the same mechanism whenever their teardown lands inside the window. Judge a
 fix here on the GROSS count across runs, never on reaching zero.
 
+## The immediate-exit refusal is the OS's answer, not tmux's
+
+A pane whose command dies on the spot must not be recorded as running. The rule
+has always been that; what changed is where the answer comes from, because the
+old source was a RACE whose outcome depended on the tmux build.
+
+THE OLD SOURCE WAS TMUX'S VIEW. `paneProcessExited` asks tmux whether the pane
+is gone or `#{pane_dead}` is set. Both are the tmux SERVER's answers, and the
+server learns of a dead child only when it reaps it - and closes the window
+that held it later still. Measured on this box, for a command that exits at
+once (`new-window ... true`):
+
+| build | fork -> process is a zombie | fork -> tmux reaps it | fork -> the window is gone |
+|---|---|---|---|
+| tmux 3.7c built from the release tarball (what ci.yml pins) | median 0.68ms | median 0.78ms | ~16ms |
+| tmux 3.7_c-1 as packaged for Manjaro | median 2.48ms | median 3.30ms | ~35ms |
+
+So the same hive, against two builds of the SAME tmux version, refuses an
+instant-exit command on one and records a dead pane on the other. `pane-created-
+with-its-command`, `process-start-result` and `created-pane-pid` failed against
+the packaged build and passed against the tarball build, with no code difference
+between the two runs. Adding 50ms of latency to the tmux CLIENT made the
+packaged build pass too, which is the shape of a race and not of a logic fault.
+
+THE OS'S ANSWER IS EXACT AND EARLIER. A pane's process is the tmux server's
+child, so an exited process is either gone or a ZOMBIE the server has not
+reaped yet - and a zombie is a pid that `kill(pid, 0)` cannot tell apart from a
+live one, so the state has to be READ, not inferred from the pid's existence.
+`ps -o state= -o pgid= -o tty= -p <pid>` answers both halves in one call: the
+state char (`Z` is a zombie) and the ESTABLISHMENT test hive already makes
+before it destroys a pane (a process group of its own and a tty of its own).
+
+THE PRE-EXEC WINDOW IS WHY THERE IS A WAIT AT ALL. The pane's child is forked
+from the tmux server and execs its command a moment later, so a state read
+taken at once can still see the fork - alive, and not the command yet. Reading
+the state is only conclusive once the command has RUN, which is why the read
+waits for the process to establish and then gives it a settle window. Measured
+over 60 runs of an instantly-exiting command: fork to zombie, median 2.07ms,
+p90 2.30ms, max 12.93ms. The settle window is 25ms, about twice the worst
+observed, and it is the same window tmux's own probe gave the decision on a
+fast build - the probe landed tens of milliseconds after the pane was created,
+and a command that died inside that window was refused.
+
+THE COST IS PAID PER PANE CREATION, INSIDE THE WINDOW CLAIM. The settle is a
+sleep, and the creation sites run inside `withWindowClaim`, which is the store's
+own write lock. So every pane creation holds that lock for the settle plus two
+`ps` calls. That is the price of a refusal that is the same on every tmux
+build, and it is paid only by a command that is about to be judged - a RETAINED
+pane (claude, codex) skips it entirely, because its tail is what the caller's
+readiness wait reports.
+
+THE FALLBACK IS STILL TMUX. `paneCommandState` answers "unknown" when the pid
+is not a pid, or when the process never establishes (no tty of its own), and
+the caller then asks tmux exactly as it always did. That is the rule's
+"unknown is never a guess" shape, in the place where it is now needed.
+
 ## Hive-owned windows carry hive's required tmux options
 
 Every window hive creates is marked with the window option `@hive-owned=1`

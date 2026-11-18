@@ -71,6 +71,8 @@ The raw probes (`rowLive`, `rowAlive`, `paneReissued`) still read an empty pid a
 
 **Two consequences the next editor here inherits.** A command that exits immediately now destroys the session `new-session` just made, so the claim throws rather than recording a dead pane - that is the reported behaviour, not a bug to smooth over. And hive's window options land one call AFTER the process is live; panes resolve inherited options at lookup time, so that is safe, and a test asserting the old ordering is asserting something that is no longer true.
 
+**The immediate-exit refusal reads the OS, never tmux.** Whether a command died on the spot is decided from the creation pid's own state, not from tmux's `#{pane_dead}`: tmux's answer lags the death by however long that build takes to close the window, so the same code refuses on one tmux build and records a dead pane on another. Ask tmux only when the OS cannot answer.
+
 ## Hive-owned windows carry hive's required tmux options
 
 A split may target a window the user created, so an unmarked window is the user's and hive must not write these options to it. The settings are best-effort: losing cosmetic configuration must never fail a spawn whose process is already live.
